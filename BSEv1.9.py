@@ -406,7 +406,7 @@ class Exchange(Orderbook):
         :return:
         """
         dumpfile = open(fname, fmode)
-        # dumpfile.write('type, time, price\n')
+        dumpfile.write('type, time, price\n')
         for tapeitem in self.tape:
             if tapeitem['type'] == 'Trade':
                 dumpfile.write('Trd, %010.3f, %s\n' % (tapeitem['time'], tapeitem['price']))
@@ -3043,8 +3043,10 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
         :return: <nothing>
         """
         bdump = open(session_id+'_blotters.csv', 'w')
+        bdump.write('trader_id, type, time, price, party1, party2, quantity\n')
+
         for trdr in trdrs:
-            bdump.write('%s, %d\n' % (trdrs[trdr].tid, len(trdrs[trdr].blotter)))
+            # bdump.write('%s, %d\n' % (trdrs[trdr].tid, len(trdrs[trdr].blotter)))
             for b in trdrs[trdr].blotter:
                 bdump.write('%s, %s, %.3f, %d, %s, %s, %d\n'
                             % (traders[trdr].tid, b['type'], b['time'], b['price'], b['party1'], b['party2'], b['qty']))
@@ -3056,6 +3058,13 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
     respond_verbose = False
     bookkeep_verbose = False
     populate_verbose = True
+
+    # initialise the exchange
+    exchange = Exchange()
+
+    # create a bunch of traders
+    traders = {}
+    trader_stats = populate_market(trader_spec, traders, True, populate_verbose)
 
     if dumpfile_flags['dump_strats']:
         strat_dump = open(sess_id + '_strats.csv', 'w')
@@ -3069,15 +3078,13 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
 
     if dumpfile_flags['dump_avgbals']:
         avg_bals = open(sess_id + '_avg_balance.csv', 'w')
+        avg_bals.write('session, time, best_bid, best_ask,')
+        ttype_list = [traders[t].ttype for t in traders]
+        for ttype in sorted(list(set(ttype_list))):
+            avg_bals.write('trader_type, total_profit, number_of_traders, average_profit,')
+        avg_bals.write('\n')
     else:
         avg_bals = None
-
-    # initialise the exchange
-    exchange = Exchange()
-
-    # create a bunch of traders
-    traders = {}
-    trader_stats = populate_market(trader_spec, traders, True, populate_verbose)
 
     # timestep set so that can process all traders in one second
     # NB minimum interarrival time of customer orders may be much less than this!!
@@ -3342,7 +3349,7 @@ if __name__ == "__main__":
             dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False,
                           'dump_avgbals': False, 'dump_tape': False}
         else:
-            dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True,
+            dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': False,
                           'dump_avgbals': True, 'dump_tape': True}
 
         market_session(trial_id, start_time, end_time, traders_spec, order_sched, dump_flags, verbose)
