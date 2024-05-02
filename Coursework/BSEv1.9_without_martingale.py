@@ -406,7 +406,7 @@ class Exchange(Orderbook):
         :return:
         """
         dumpfile = open(fname, fmode)
-        dumpfile.write('type, time, price\n')
+        # dumpfile.write('type, time, price\n')
         for tapeitem in self.tape:
             if tapeitem['type'] == 'Trade':
                 dumpfile.write('Trd, %010.3f, %s\n' % (tapeitem['time'], tapeitem['price']))
@@ -2281,61 +2281,40 @@ class TraderMMM01(Trader):
 
     # end of MMM01 definition
 
-
 class TraderMMM02(Trader):
     """
     MMM: Minimal Market-Maker: a minimally simple trader that buys & sells to make profit
 
-    MMM02 long-only buy-and-hold strategy in pseudocode:
-
-    1 wait until the market has been open for 5 minutes (to give prices a chance to settle)
-    2 then repeat forever:
-    2.1 if (I am not holding a unit)
-    2.1.1  and (best ask price is "cheap" -- i.e., less than average of recent transaction prices)
-    2.1.2  and (I have enough money in my bank to pay the asking price)
-    2.2 then
-    2.2.1   (buy the unit -- lift the ask)
-    2.2.2   (remember the purchase-price I paid for it)
-    2.3 else if (I am holding a unit)
-    2.4 then
-    2.4.1   (my asking-price is that unit’s purchase-price plus my profit margin)
-    2.4.1   if (best bid price is more than my asking price)
-    2.4.1   then
-    2.4.1.1    (sell my unit -- hit the bid)
-    2.4.1.2    (put the money in my bank)
+    MMM02 MACD, RSI and EMA-based strategy:
+    1. Wait until the market has been open for 5 minutes (to give prices a chance to settle)
+    2. Then repeat forever:
+        2.1. Calculate the Exponential Moving Average (EMA), Moving Average Convergence Divergence (MACD) and Relative Strength Index (RSI) of recent transaction prices
+        2.2. If I am not holding a unit:
+            2.2.1. And the current price is above the 200-period EMA
+            2.2.2. And the DIF has just crossed above the DEA (golden cross)  
+            2.2.3. And the RSI is greater than or equal to 50
+            2.2.4. And I have enough money in my bank to pay the asking price
+            2.2.5. Then buy the unit (lift the ask) and remember the purchase-price
+        2.3. Else if I am holding a unit:
+            2.4. Then:  
+                2.4.1. My asking-price is that unit's purchase-price plus a profit margin (at least double the loss threshold)
+                2.4.1. If the best bid price is more than my asking price:
+                    2.4.1.1. Sell my unit (hit the bid)  
+                    2.4.1.2. Put the money in my bank
+        2.5. If the current holding price has dropped to the lowest price in the last 20 trades, sell immediately to limit losses.
     """
 
-    def __init__(self, ttype, tid, balance, params, time):
-        """
-        Construct an MMM trader
-        :param ttype: the ticker-symbol for the type of trader (its strategy)
-        :param tid: the trader id
-        :param balance: the trader's bank balance
-        :param params: a dictionary of optional parameter-values to override the defaults
-        :param time: the current time.
-        """
-
+    def __init__(self, ttype, tid, balance, params, time):  
         Trader.__init__(self, ttype, tid, balance, params, time)
         self.job = 'Buy'  # flag switches between 'Buy' & 'Sell'; shows what MMM02 is currently trying to do
         self.last_purchase_price = None
-
-        # Default parameter-values
-        self.n_past_trades = 5      # how many recent trades used to compute average price (avg_p)?
-        self.bid_percent = 0.9999   # what percentage of avg_p should best_ask be for this trader to bid
-        self.ask_delta = 5          # how much (absolute value) to improve on purchase price
-
-        # Did the caller provide different params?
-        if type(params) is dict:
-            if 'bid_delta' in params:
-                self.bid_percent = params['bid_percent']
-                if self.bid_percent > 1.0 or self.bid_percent < 0.01:
-                    sys.exit('FAIL: self.bid_percent=%f not in range [0.01,1.0])' % self.bid_percent)
-            if 'ask_delta' in params:
-                self.ask_delta = params['ask_delta']
-            if 'n_past_trades' in params:
-                self.n_past_trades = int(round(params['self_past_trades']))
-                if self.n_past_trades < 1:
-                    sys.exit("Fail: MM01 n_past trades must be 1 or more")
+        self.profit_margin = 0.03    # at least 3% profit margin on sale
+        self.ema_long = 14          # 26-period Exponential Moving Average
+        self.ema_short = 9         # 12-period Exponential Moving Average 
+        self.ema_signal = 6         # 9-period Exponential Moving Average for MACD signal line (DEA)
+        self.ema_buy_overall = 16     # 200-period Exponential Moving Average
+        self.ema_sell_overall = 20  # 210-period Exponential Moving Average
+        self.n_past_trades = 20    # how many recent trades used to compute EMA, MACD and RSI
 
     def getorder(self, time, countdown, lob):
         """
@@ -2345,107 +2324,145 @@ class TraderMMM02(Trader):
         :param lob: the public lob.
         :return: trader's new order, or None.
         """
-        # this test for negative countdown is purely to stop PyCharm warning about unused parameter value
-        if countdown < 0:
-            sys.exit('Negative countdown')
-
         if len(self.orders) < 1 or time < 5 * 60:
             order = None
         else:
             quoteprice = self.orders[0].price
             order = Order(self.tid,
-                          self.orders[0].otype,
+                          self.orders[0].otype, 
                           quoteprice,
-                          self.orders[0].qty,
+                          self.orders[0].qty, 
                           time, lob['QID'])
             self.lastquote = order
         return order
-
+    
     def respond(self, time, lob, trade, vrbs):
-        """
-        Respond to the current state of the public lob.
-        Buys if best bid is less than simple moving average of recent transcaction prices.
-        Sells as soon as it can make an acceptable profit.
-        :param time: the current time
-        :param lob: the current public lob
-        :param trade:
-        :param vrbs: if True then print running commentary, else stay silent
-        :return: <nothing>
-        """
-
         vrbs = False
-        vstr = 't=%f MM01 respond: ' % time
+        vstr = 't=%f MMM02 respond: ' % time
 
-        # what is average price of most recent n trades?
-        # work backwards from end of tape (most recent trade)
-        tape_position = -1
         n_prices = 0
-        sum_prices = 0
-        avg_price_ok = False
-        avg_price = -1
-        while n_prices < self.n_past_trades and abs(tape_position) < len(lob['tape']):
+        tape_position = -1
+        while n_prices < self.n_past_trades and abs(tape_position) < len(lob['tape']) and time > 5 * 60:
             if lob['tape'][tape_position]['type'] == 'Trade':
-                price = lob['tape'][tape_position]['price']
                 n_prices += 1
-                sum_prices += price
             tape_position -= 1
+        
         if n_prices == self.n_past_trades:
-            # there's been enough trades to form an acceptable average
-            avg_price = int(round(sum_prices / n_prices))
-            avg_price_ok = True
-        vstr += "avg_price_ok=%s, avg_price=%d " % (avg_price_ok, avg_price)
+            ema_buy_overall, ema_sell_overall, dif, dea, min_price = self.calculate_indicators(lob['tape'][-100:], self.n_past_trades)
 
-        # buying?
-        if self.job == 'Buy' and avg_price_ok:
-            vstr += 'Buying - '
-            # see what's on the LOB
-            if lob['asks']['n'] > 0:
-                # there is at least one ask on the LOB
-                best_ask = lob['asks']['best']
-                if best_ask / avg_price < self.bid_percent:
-                    # bestask is good value: send a spread-crossing bid to lift the ask
-                    bidprice = best_ask + 1
-                    if bidprice < self.balance:
-                        # can afford to buy
-                        # create the bid by issuing order to self, which will be processed in getorder()
-                        order = Order(self.tid, 'Bid', bidprice, 1, time, lob['QID'])
-                        self.orders = [order]
-                        vstr += 'Best ask=%d, bidprice=%d, order=%s ' % (best_ask, bidprice, order)
+            # Buying?
+            order = None
+            if self.job == 'Buy':
+                vstr += 'Buying - '
+                # See what's on the LOB
+                if lob['asks']['n'] > 0:
+                    best_ask = lob['asks']['best']
+                    # Check buying conditions
+                    if dif is not None and dea is not None and ema_buy_overall is not None:
+                        if dif > dea and best_ask < ema_buy_overall:
+                            # Best ask is above 200-period EMA, DIF has just crossed above the DEA, and I can afford to buy
+                            bidprice = best_ask + 1
+                            if best_ask < self.balance:
+                                order = Order(self.tid, 'Bid', bidprice, 1, time, lob['QID'])
+                                self.orders = [order]
+                                self.min_purchase_price = min_price
+                                vstr += 'Best ask=%.2f, bidprice=%.2f, order=%s ' % (best_ask, bidprice, order)
+                            else:
+                                vstr += 'Balance not enough'
+                        else:
+                            vstr += 'Not a good time to buy'
+                    else:
+                        vstr += 'Indicators not ready'
                 else:
-                    vstr += 'bestask=%d >= avg_price=%d' % (best_ask, avg_price)
-            else:
-                vstr += 'No asks on LOB'
-        # selling?
-        elif self.job == 'Sell':
-            vstr += 'Selling - '
-            # see what's on the LOB
-            if lob['bids']['n'] > 0:
-                # there is at least one bid on the LOB
-                best_bid = lob['bids']['best']
-                # sell single unit at price of purchaseprice+askdelta
-                askprice = self.last_purchase_price + self.ask_delta
-                if askprice < best_bid:
-                    # seems we have a buyer
-                    # lift the ask by issuing order to self, which will processed in getorder()
-                    order = Order(self.tid, 'Ask', askprice, 1, time, lob['QID'])
-                    self.orders = [order]
-                    vstr += 'Best bid=%d greater than askprice=%d order=%s ' % (best_bid, askprice, order)
+                    vstr += 'No asks on LOB'
+            # selling?
+            elif self.job == 'Sell':
+                vstr += 'Selling - '
+                # see what's on the LOB
+                if lob['bids']['n'] > 0:
+                    # there is at least one bid on the LOB
+                    best_bid = lob['bids']['best']
+                    askprice = self.last_purchase_price * (1 + self.profit_margin)
+                    # sell single unit at price of purchaseprice + askdelta
+                    if dif is not None and dea is not None:
+                        if dif < dea and best_bid > self.last_purchase_price + 5:
+                            order = Order(self.tid, 'Ask', best_bid, 1, time, lob['QID'])
+                            self.orders = [order]
+                            vstr += 'Best bid=%d greater than askprice=%d order=%s ' % (best_bid, best_bid, order)
+                        elif askprice < best_bid:
+                            # seems we have a buyer
+                            # lift the ask by issuing order to self, which will processed in getorder()
+                            order = Order(self.tid, 'Ask', askprice, 1, time, lob['QID'])
+                            self.orders = [order]
+                            vstr += 'Best bid=%d greater than askprice=%d order=%s ' % (best_bid, askprice, order)
+                        elif best_bid < self.min_purchase_price * 0.97:
+                            order = Order(self.tid, 'Ask', best_bid, 1, time, lob['QID'])
+                            vstr += 'Forced to sell due to loss limit'
+                        else:
+                            vstr += 'Best bid=%d too low for askprice=%d ' % (best_bid, askprice)
+                    else:
+                        vstr += 'Indicators not ready'
                 else:
-                    vstr += 'Best bid=%d too low for askprice=%d ' % (best_bid, askprice)
-            else:
-                vstr += 'No bids on LOB'
+                    vstr += 'No bids on LOB'          
+            self.profitpertime = self.profitpertime_update(time, self.birthtime, self.balance)
+                        
+            if vrbs:
+                print(vstr)
 
-        self.profitpertime = self.profitpertime_update(time, self.birthtime, self.balance)
+    def calculate_ema(self, prices, n):
+        if len(prices) < n:
+            return None
+        ema = prices[-n]
+        alpha = 2 / (n + 1)
+        for price in prices[-n+1:]:
+            ema = price * alpha + ema * (1 - alpha)
+        return ema
 
-        if vrbs:
-            print(vstr)
+    def calculate_macd(self, prices):
+        if len(prices) < self.ema_long:
+            return None, None
+        
+        ema_short = prices[-self.ema_short]
+        ema_long = prices[-self.ema_long]
+        alpha_short = 2 / (self.ema_short + 1)
+        alpha_long = 2 / (self.ema_long + 1)
+        
+        for price in prices[-self.ema_long+1:]:
+            ema_short = price * alpha_short + ema_short * (1 - alpha_short)
+            ema_long = price * alpha_long + ema_long * (1 - alpha_long)
+        
+        dif = ema_short - ema_long
+        
+        if len(prices) < self.ema_long + self.ema_signal - 1:
+            return dif, None
+        
+        dea = dif
+        alpha_signal = 2 / (self.ema_signal + 1)
+        
+        for dif_value in [ema_short - ema_long for ema_short, ema_long in 
+                        zip(prices[-self.ema_long-self.ema_signal+2:-self.ema_short], 
+                            prices[-self.ema_long-self.ema_signal+2:-self.ema_long])]:
+            dea = dif_value * alpha_signal + dea * (1 - alpha_signal)
+        
+        return dif, dea
 
+    def calculate_indicators(self, tape, n_past_trades):
+        prices = [t['price'] for t in tape if t['type'] == 'Trade']
+        if len(prices) < n_past_trades:
+            return None, None, None, None, None
+        else:
+            min_price = min(prices[-200:])
+            ema_buy_overall = self.calculate_ema(prices, self.ema_buy_overall)
+            ema_sell_overall = self.calculate_ema(prices, self.ema_sell_overall)
+            dif, dea = self.calculate_macd(prices)
+            return ema_buy_overall, ema_sell_overall, dif, dea, min_price      
+        
     def bookkeep(self, time, trade, order, vrbs):
         """
         Update trader's records of its bank balance, current orders, and current job
         :param trade: the current time
-        :param order: this trader's successful order
-        :param vrbs: if True then print a running commentary, otherwise stay silent.
+        :param order: this trader's successful order  
+        :param vrbs: verbosity -- if True then print running commentary, else stay silent.
         :param time: the current time.
         :return: <nothing>
         """
@@ -2457,7 +2474,7 @@ class TraderMMM02(Trader):
         hrs = int(mins//60)
         mins = mins - 60 * hrs
         outstr = 't=%f (%dh%02dm%02ds) %s (%s) bookkeep: orders=' % (time, hrs, mins, secs, self.tid, self.ttype)
-        for order in self.orders:
+        for order in self.orders:  
             outstr = outstr + str(order)
 
         self.blotter.append(trade)  # add trade record to trader's blotter
@@ -2482,9 +2499,7 @@ class TraderMMM02(Trader):
             print('%s Balance=%d NetWorth=%d' % (outstr, self.balance, net_worth))
 
         self.del_order(order)  # delete the order
-
-    # end of MMM02 definition
-
+# end of MMM02 definition
 # ########################---trader-types have all been defined now--################
 
 
@@ -3043,10 +3058,8 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
         :return: <nothing>
         """
         bdump = open(session_id+'_blotters.csv', 'w')
-        bdump.write('trader_id, type, time, price, party1, party2, quantity\n')
-
         for trdr in trdrs:
-            # bdump.write('%s, %d\n' % (trdrs[trdr].tid, len(trdrs[trdr].blotter)))
+            bdump.write('%s, %d\n' % (trdrs[trdr].tid, len(trdrs[trdr].blotter)))
             for b in trdrs[trdr].blotter:
                 bdump.write('%s, %s, %.3f, %d, %s, %s, %d\n'
                             % (traders[trdr].tid, b['type'], b['time'], b['price'], b['party1'], b['party2'], b['qty']))
@@ -3058,13 +3071,6 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
     respond_verbose = False
     bookkeep_verbose = False
     populate_verbose = True
-
-    # initialise the exchange
-    exchange = Exchange()
-
-    # create a bunch of traders
-    traders = {}
-    trader_stats = populate_market(trader_spec, traders, True, populate_verbose)
 
     if dumpfile_flags['dump_strats']:
         strat_dump = open(sess_id + '_strats.csv', 'w')
@@ -3078,13 +3084,15 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
 
     if dumpfile_flags['dump_avgbals']:
         avg_bals = open(sess_id + '_avg_balance.csv', 'w')
-        avg_bals.write('session, time, best_bid, best_ask,')
-        ttype_list = [traders[t].ttype for t in traders]
-        for ttype in sorted(list(set(ttype_list))):
-            avg_bals.write('trader_type, total_profit, number_of_traders, average_profit,')
-        avg_bals.write('\n')
     else:
         avg_bals = None
+
+    # initialise the exchange
+    exchange = Exchange()
+
+    # create a bunch of traders
+    traders = {}
+    trader_stats = populate_market(trader_spec, traders, True, populate_verbose)
 
     # timestep set so that can process all traders in one second
     # NB minimum interarrival time of customer orders may be much less than this!!
@@ -3194,13 +3202,13 @@ def market_session(sess_id, starttime, endtime, trader_spec, order_schedule, dum
 if __name__ == "__main__":
 
     # if called from the command line with one argument, that argument is the price offset filename
-    price_offset_filename = 'offset-nasdaq-1m-170913.csv'
+    price_offset_filename = 'offset-ibm-1m-170831.csv'
     if len(sys.argv) > 1:
         price_offset_filename = sys.argv[1]
 
     # set up common parameters for all market sessions
     # 1000 days is often good, but 3*365=1095, so may as well go for three years.
-    n_days = 1
+    n_days = 22
     hours_in_a_day = 7.5
     start_time = 0.0
     end_time = 60.0 * 60.0 * hours_in_a_day * n_days
@@ -3320,16 +3328,16 @@ if __name__ == "__main__":
 
     order_sched = {'sup': supply_schedule, 'dem': demand_schedule,
                    'interval': order_interval, 'timemode': 'drip-poisson'}
-    
+
     # run a sequence of trials, one session per trial
 
     verbose = False
 
     # n_trials is how many trials (i.e. market sessions) to run in total
-    n_trials = 5
+    n_trials = 30
 
     # n_recorded is how many trials (i.e. market sessions) to write full data-files for
-    n_trials_recorded = 5
+    n_trials_recorded = 30
 
     trial = 1
 
@@ -3349,7 +3357,7 @@ if __name__ == "__main__":
             dump_flags = {'dump_blotters': False, 'dump_lobs': False, 'dump_strats': False,
                           'dump_avgbals': False, 'dump_tape': False}
         else:
-            dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': False,
+            dump_flags = {'dump_blotters': True, 'dump_lobs': False, 'dump_strats': True,
                           'dump_avgbals': True, 'dump_tape': True}
 
         market_session(trial_id, start_time, end_time, traders_spec, order_sched, dump_flags, verbose)
